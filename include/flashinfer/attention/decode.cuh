@@ -392,7 +392,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
  */
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
-          typename Params>
+          typename Params, bool use_local_remote_page_table = false>
 __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& params, uint8_t smem[],
                                                              const uint32_t bx = blockIdx.x,
                                                              const uint32_t by = blockIdx.y,
@@ -414,6 +414,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   const bool partition_kv = params.partition_kv;
 
   constexpr uint32_t head_dim = bdx * vec_size;
+  constexpr uint32_t num_threads = bdx * bdy * bdz;
   const uint32_t batch_idx = params.request_indices[bx];
   const uint32_t kv_tile_idx = params.kv_tile_indices[bx];
   const uint32_t kv_head_idx = by;
@@ -433,8 +434,12 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   DTypeKV* k_smem = (DTypeKV*)smem;
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                           sizeof(DTypeKV));
-  size_t* kv_offset_smem = (size_t*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
-                                                head_dim * sizeof(DTypeKV));
+  void* kv_ptr_smem_storage =
+      smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim * sizeof(DTypeKV);
+  size_t* kv_offset_smem = reinterpret_cast<size_t*>(kv_ptr_smem_storage);
+  DTypeKV** k_ptr_smem = reinterpret_cast<DTypeKV**>(kv_ptr_smem_storage);
+  DTypeKV** v_ptr_smem =
+      k_ptr_smem + tile_size_per_bdx * static_cast<uint32_t>(num_threads);
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                        sizeof(DTypeKV));
 
@@ -482,25 +487,38 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
     uint32_t q, r;
     paged_kv.page_size.divmod(packed_page_iter_base + ((j * bdz + tz) * bdy + ty) * bdx + tx, q, r);
-    kv_offset_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
-        paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
+    const uint32_t smem_idx = ((j * bdz + tz) * bdy + ty) * bdx + tx;
+    if constexpr (use_local_remote_page_table) {
+      k_ptr_smem[smem_idx] = paged_kv.protective_get_k_ptr(q, kv_head_idx, r, 0, last_indptr);
+      v_ptr_smem[smem_idx] = paged_kv.protective_get_v_ptr(q, kv_head_idx, r, 0, last_indptr);
+    } else {
+      kv_offset_smem[smem_idx] =
+          paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
+    }
   }
   block.sync();
 
   size_t kv_offset[tile_size_per_bdx];
+  DTypeKV* k_ptr[tile_size_per_bdx];
+  DTypeKV* v_ptr[tile_size_per_bdx];
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      kv_offset[j] =
-          kv_offset_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j] + tx * vec_size;
+      const uint32_t smem_idx = ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j;
+      if constexpr (use_local_remote_page_table) {
+        k_ptr[j] = k_ptr_smem[smem_idx] + tx * vec_size;
+        v_ptr[j] = v_ptr_smem[smem_idx] + tx * vec_size;
+      } else {
+        kv_offset[j] = kv_offset_smem[smem_idx] + tx * vec_size;
+      }
     }
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          paged_kv.k_data + kv_offset[j],
+          use_local_remote_page_table ? k_ptr[j] : paged_kv.k_data + kv_offset[j],
           ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
     cp_async::commit_group();
@@ -509,7 +527,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          paged_kv.v_data + kv_offset[j],
+          use_local_remote_page_table ? v_ptr[j] : paged_kv.v_data + kv_offset[j],
           ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
     cp_async::commit_group();
@@ -529,8 +547,14 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
             packed_page_iter_base + ((iter + num_stages_smem) * tile_size_per_bdx * bdy * bdz +
                                      ((j * bdz + tz) * bdy + ty) * bdx + tx),
             q, r);
-        kv_offset_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
-            paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
+        const uint32_t smem_idx = ((j * bdz + tz) * bdy + ty) * bdx + tx;
+        if constexpr (use_local_remote_page_table) {
+          k_ptr_smem[smem_idx] = paged_kv.protective_get_k_ptr(q, kv_head_idx, r, 0, last_indptr);
+          v_ptr_smem[smem_idx] = paged_kv.protective_get_v_ptr(q, kv_head_idx, r, 0, last_indptr);
+        } else {
+          kv_offset_smem[smem_idx] =
+              paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
+        }
       }
     }
     // compute qk
@@ -547,10 +571,14 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      kv_offset[j] = kv_offset_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) *
-                                        tile_size_per_bdx +
-                                    j] +
-                     tx * vec_size;
+      const uint32_t smem_idx =
+          ((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j;
+      if constexpr (use_local_remote_page_table) {
+        k_ptr[j] = k_ptr_smem[smem_idx] + tx * vec_size;
+        v_ptr[j] = v_ptr_smem[smem_idx] + tx * vec_size;
+      } else {
+        kv_offset[j] = kv_offset_smem[smem_idx] + tx * vec_size;
+      }
     }
 
     // load k tiles
@@ -559,7 +587,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          paged_kv.k_data + kv_offset[j],
+          use_local_remote_page_table ? k_ptr[j] : paged_kv.k_data + kv_offset[j],
           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
     cp_async::commit_group();
@@ -577,7 +605,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          paged_kv.v_data + kv_offset[j],
+          use_local_remote_page_table ? v_ptr[j] : paged_kv.v_data + kv_offset[j],
           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
     cp_async::commit_group();
@@ -614,6 +642,16 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   extern __shared__ uint8_t smem[];
   BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
                                     bdx, bdy, bdz, AttentionVariant>(params, smem);
+}
+
+template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
+          typename Params>
+__global__ void BatchDecodeWithPagedKVCacheLocalRemoteKernel(
+    const __grid_constant__ Params params) {
+  extern __shared__ uint8_t smem[];
+  BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
+                                    bdx, bdy, bdz, AttentionVariant, Params, true>(params, smem);
 }
 
 /*!
@@ -800,6 +838,88 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         params.partition_kv = true;
         auto o = params.o;
         auto lse = params.lse;
+        params.o = tmp_v;
+        params.lse = tmp_s;
+        if (enable_pdl) {
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+        } else {
+          void* args[] = {(void*)&params};
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        }
+        if constexpr (AttentionVariant::use_softmax) {
+          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
+              num_qo_heads, HEAD_DIM, enable_pdl, stream));
+        } else {
+          FLASHINFER_CUDA_CALL(
+              VariableLengthAttentionSum(tmp_v, params.o_indptr, o, params.paged_kv.batch_size,
+                                         nullptr, num_qo_heads, HEAD_DIM, enable_pdl, stream));
+        }
+      }
+    });
+  });
+  return cudaSuccess;
+}
+
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
+          typename Params>
+cudaError_t BatchDecodeWithPagedKVCacheLocalRemoteDispatched(
+    Params params, typename Params::DTypeO* tmp_v, float* tmp_s, bool enable_pdl,
+    cudaStream_t stream) {
+  using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
+  const uint32_t num_qo_heads = params.num_qo_heads;
+  const uint32_t num_kv_heads = params.paged_kv.num_heads;
+  const uint32_t padded_batch_size = params.padded_batch_size;
+
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+  auto compute_capacity = GetCudaComputeCapability();
+  constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  static_assert(bdx <= 32);
+  DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+    constexpr uint32_t bdy = GROUP_SIZE;
+    constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+    constexpr uint32_t bdz = num_threads / (bdx * bdy);
+    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
+    DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
+      const uint32_t smem_size =
+          2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
+          std::max(2 * tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
+                   2 * bdy * bdz * sizeof(float));
+      auto kernel = BatchDecodeWithPagedKVCacheLocalRemoteKernel<
+          POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx, vec_size, bdx, bdy, bdz,
+          AttentionVariant, Params>;
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      dim3 nblks(padded_batch_size, num_kv_heads);
+      dim3 nthrs(bdx, bdy, bdz);
+
+      cudaLaunchAttribute attribute[1];
+      cudaLaunchConfig_t config;
+      if (enable_pdl) {
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        config.gridDim = nblks;
+        config.blockDim = nthrs;
+        config.dynamicSmemBytes = smem_size;
+        config.stream = stream;
+      }
+      if (tmp_v == nullptr) {
+        params.partition_kv = false;
+        if (enable_pdl) {
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+        } else {
+          void* args[] = {(void*)&params};
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        }
+      } else {
+        params.partition_kv = true;
+        DTypeO* o = params.o;
+        float* lse = params.lse;
         params.o = tmp_v;
         params.lse = tmp_s;
         if (enable_pdl) {

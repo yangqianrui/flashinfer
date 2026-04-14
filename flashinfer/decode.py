@@ -145,6 +145,7 @@ def get_single_decode_module(*args):
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
     run_func = jit_module.run
+    run_local_remote_func = jit_module.run_local_remote
 
     @register_custom_op(
         f"flashinfer::{module_name}_run",
@@ -212,9 +213,87 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
     ) -> None:
         pass
 
+    @register_custom_op(
+        f"flashinfer::{module_name}_run_local_remote",
+        mutates_args=(
+            "float_workspace_buffer",
+            "int_workspace_buffer",
+            "paged_k_cache_local",
+            "paged_v_cache_local",
+            "paged_k_cache_remote",
+            "paged_v_cache_remote",
+            "o",
+            "maybe_lse",
+        ),
+    )
+    def run_batch_decode_local_remote(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache_local: torch.Tensor,
+        paged_v_cache_local: torch.Tensor,
+        paged_k_cache_remote: torch.Tensor,
+        paged_v_cache_remote: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        paged_kv_page_device: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        kv_layout_code: int,
+        window_left: int,
+        enable_pdl: bool,
+        *args,
+    ) -> None:
+        run_local_remote_func(
+            float_workspace_buffer,
+            int_workspace_buffer,
+            plan_info_vec,
+            q,
+            paged_k_cache_local,
+            paged_v_cache_local,
+            paged_k_cache_remote,
+            paged_v_cache_remote,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            paged_kv_page_device,
+            o,
+            maybe_lse,
+            kv_layout_code,
+            window_left,
+            enable_pdl,
+            *args,
+        )
+
+    @register_fake_op(f"flashinfer::{module_name}_run_local_remote")
+    def _fake_run_batch_decode_local_remote(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache_local: torch.Tensor,
+        paged_v_cache_local: torch.Tensor,
+        paged_k_cache_remote: torch.Tensor,
+        paged_v_cache_remote: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        paged_kv_page_device: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        kv_layout_code: int,
+        window_left: int,
+        enable_pdl: bool,
+        *args,
+    ) -> None:
+        pass
+
     return SimpleNamespace(
         plan=plan_func,
         run=run_batch_decode,
+        run_local_remote=run_batch_decode_local_remote,
     )
 
 
@@ -224,6 +303,7 @@ def get_batch_decode_module(*args):
     mod = gen_batch_decode_module(*args).build_and_load()
     plan_func = mod.plan
     run_func = mod.run
+    run_local_remote_func = mod.run_local_remote
 
     # torch library for batch_decode_with_paged_kv_cache_run
 
@@ -305,6 +385,95 @@ def get_batch_decode_module(*args):
     ) -> None:
         pass
 
+    @register_custom_op(
+        f"flashinfer::{uri}_run_local_remote",
+        mutates_args=(
+            "float_workspace_buffer",
+            "int_workspace_buffer",
+            "paged_k_cache_local",
+            "paged_v_cache_local",
+            "paged_k_cache_remote",
+            "paged_v_cache_remote",
+            "o",
+            "maybe_lse",
+        ),
+    )
+    def run_batch_decode_local_remote(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache_local: torch.Tensor,
+        paged_v_cache_local: torch.Tensor,
+        paged_k_cache_remote: torch.Tensor,
+        paged_v_cache_remote: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        paged_kv_page_device: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        kv_layout_code: int,
+        window_left: int,
+        enable_pdl: bool,
+        alibi_slopes: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+    ) -> None:
+        run_local_remote_func(
+            float_workspace_buffer,
+            int_workspace_buffer,
+            plan_info_vec,
+            q,
+            paged_k_cache_local,
+            paged_v_cache_local,
+            paged_k_cache_remote,
+            paged_v_cache_remote,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            paged_kv_page_device,
+            o,
+            maybe_lse,
+            kv_layout_code,
+            window_left,
+            enable_pdl,
+            alibi_slopes,
+            logits_soft_cap,
+            sm_scale,
+            1.0 / rope_scale,
+            1.0 / rope_theta,
+        )
+
+    @register_fake_op(f"flashinfer::{uri}_run_local_remote")
+    def _fake_run_batch_decode_local_remote(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache_local: torch.Tensor,
+        paged_v_cache_local: torch.Tensor,
+        paged_k_cache_remote: torch.Tensor,
+        paged_v_cache_remote: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        paged_kv_page_device: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        kv_layout_code: int,
+        window_left: int,
+        enable_pdl: bool,
+        alibi_slopes: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+    ) -> None:
+        pass
+
     # Register the module.
     #
     # Note that plan is not part of model logic. It should not be included in
@@ -312,6 +481,7 @@ def get_batch_decode_module(*args):
     return SimpleNamespace(
         plan=plan_func,
         run=run_batch_decode,
+        run_local_remote=run_batch_decode_local_remote,
     )
 
 
@@ -1518,6 +1688,146 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 out = (out.to(torch.float32) * v_scale).to(out.dtype)
             else:
                 out *= v_scale
+
+        return (out, lse) if return_lse else out
+
+    @flashinfer_api
+    def run_local_remote(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache_local: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        paged_kv_cache_remote: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        paged_kv_page_device: torch.Tensor,
+        *args,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+        enable_pdl: Optional[bool] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.use_tensor_cores or self._backend == "trtllm-gen":
+            raise ValueError("run_local_remote is only implemented for CUDA-core batch decode.")
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q.device)
+
+        k_cache_local, v_cache_local = _unpack_paged_kv_cache(
+            paged_kv_cache_local, self._kv_layout
+        )
+        k_cache_remote, v_cache_remote = _unpack_paged_kv_cache(
+            paged_kv_cache_remote, self._kv_layout
+        )
+        if k_cache_remote.shape != k_cache_local.shape:
+            raise ValueError(
+                f"k_cache_remote.shape {tuple(k_cache_remote.shape)} does not match "
+                f"k_cache_local.shape {tuple(k_cache_local.shape)}."
+            )
+        if v_cache_remote.shape != v_cache_local.shape:
+            raise ValueError(
+                f"v_cache_remote.shape {tuple(v_cache_remote.shape)} does not match "
+                f"v_cache_local.shape {tuple(v_cache_local.shape)}."
+            )
+
+        _check_cached_qkv_data_type(
+            q, k_cache_local, self._cached_q_data_type, self._cached_kv_data_type
+        )
+        _check_cached_qkv_data_type(
+            q, k_cache_remote, self._cached_q_data_type, self._cached_kv_data_type
+        )
+        if v_cache_remote.dtype != v_cache_local.dtype:
+            raise ValueError(
+                f"v_cache_remote.dtype {v_cache_remote.dtype} does not match "
+                f"v_cache_local.dtype {v_cache_local.dtype}."
+            )
+
+        actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
+        if q.size(0) != actual_batch_size:
+            raise ValueError(
+                f"q.shape[0] ({q.size(0)}) does not match batch_size ({actual_batch_size})."
+            )
+        if paged_kv_page_device.dtype != torch.int32:
+            raise ValueError("paged_kv_page_device must be torch.int32.")
+        if paged_kv_page_device.device != q.device:
+            paged_kv_page_device = paged_kv_page_device.to(q.device, non_blocking=True)
+        if paged_kv_page_device.numel() < self._paged_kv_indices_buf.numel():
+            raise ValueError(
+                "paged_kv_page_device must have at least as many entries as paged_kv_indices."
+            )
+
+        window_left = self._window_left
+        logits_soft_cap = self._logits_soft_cap
+        sm_scale = self._sm_scale
+        rope_scale = self._rope_scale
+        rope_theta = self._rope_theta
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(q.shape[-1])
+        if q_scale is not None:
+            sm_scale *= q_scale
+        if k_scale is not None:
+            sm_scale *= k_scale
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+
+        if return_lse:
+            if lse is None:
+                lse = torch.empty(
+                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+                )
+            else:
+                check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
+
+        if out is None:
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            out = torch.empty(q.shape, dtype=out_dtype, device=q.device)
+        else:
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            check_shape_dtype_device(out, q.shape, out_dtype, q.device, "out")
+
+        plan_info = self._plan_info
+        assert plan_info is not None, "plan info is not initialized"
+        run_args = [
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            plan_info,
+            q,
+            k_cache_local,
+            v_cache_local,
+            k_cache_remote,
+            v_cache_remote,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            paged_kv_page_device,
+            out,
+            lse,
+            TensorLayout[self._kv_layout].value,
+            window_left,
+            enable_pdl,
+        ]
+
+        if self._jit_module is not None:
+            run_args.extend(list(args))
+        else:
+            run_args += [
+                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                logits_soft_cap,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+            ]
+
+        self._cached_module.run_local_remote(*run_args)
+
+        is_float_one = isinstance(v_scale, float) and v_scale == 1.0
+        if v_scale is not None and not is_float_one:
+            out *= v_scale
 
         return (out, lse) if return_lse else out
 

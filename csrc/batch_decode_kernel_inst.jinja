@@ -10,4 +10,9 @@ BatchDecodeWithPagedKVCacheDispatched<{{ head_dim_qk }}, {{ pos_encoding_mode }}
     Params params, {{ dtype_o }}* tmp_v,
     float* tmp_s, bool enable_pdl, cudaStream_t stream);
 
+template cudaError_t
+BatchDecodeWithPagedKVCacheLocalRemoteDispatched<{{ head_dim_qk }}, {{ pos_encoding_mode }}, {{ variant_name }}, ParamsLocalRemote>(
+    ParamsLocalRemote params, {{ dtype_o }}* tmp_v,
+    float* tmp_s, bool enable_pdl, cudaStream_t stream);
+
 };

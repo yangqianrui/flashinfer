@@ -209,6 +209,75 @@ struct paged_kv_t {
   }
 };
 
+template <typename DType, typename IdType>
+struct paged_kv_local_remote_t : public paged_kv_t<DType, IdType> {
+  DType* k_data_remote;
+  DType* v_data_remote;
+  IdType* page_device;
+
+  __host__ __device__ __forceinline__ paged_kv_local_remote_t()
+      : paged_kv_t<DType, IdType>(),
+        k_data_remote(nullptr),
+        v_data_remote(nullptr),
+        page_device(nullptr) {}
+
+  __host__ __forceinline__ paged_kv_local_remote_t(
+      uint32_t num_heads, uint32_t page_size, uint32_t head_dim, uint32_t batch_size,
+      QKVLayout layout, DType* k_data_local, DType* v_data_local, DType* k_data_remote,
+      DType* v_data_remote, IdType* indices, IdType* indptr, IdType* last_page_len,
+      IdType* page_device, IdType* rope_pos_offset = nullptr)
+      : paged_kv_t<DType, IdType>(num_heads, page_size, head_dim, batch_size, layout,
+                                  k_data_local, v_data_local, indices, indptr, last_page_len,
+                                  rope_pos_offset),
+        k_data_remote(k_data_remote),
+        v_data_remote(v_data_remote),
+        page_device(page_device) {}
+
+  __host__ __forceinline__ paged_kv_local_remote_t(
+      uint32_t num_heads, uint32_t page_size, uint32_t head_dim, uint32_t batch_size,
+      QKVLayout layout, DType* k_data_local, DType* v_data_local, DType* k_data_remote,
+      DType* v_data_remote, const int64_t* kv_strides, IdType* indices, IdType* indptr,
+      IdType* last_page_len, IdType* page_device, IdType* rope_pos_offset = nullptr)
+      : paged_kv_t<DType, IdType>(num_heads, page_size, head_dim, batch_size, layout,
+                                  k_data_local, v_data_local, kv_strides, indices, indptr,
+                                  last_page_len, rope_pos_offset),
+        k_data_remote(k_data_remote),
+        v_data_remote(v_data_remote),
+        page_device(page_device) {}
+
+  __device__ __forceinline__ bool use_remote_page(IdType page_iter) const {
+    return page_device != nullptr && __ldg(page_device + page_iter) != 0;
+  }
+
+  __device__ __forceinline__ DType* protective_get_k_ptr(IdType page_iter, uint32_t head_idx,
+                                                         uint32_t entry_idx, uint32_t feat_idx,
+                                                         IdType last_indptr) const {
+    if (page_iter < last_indptr) {
+      const size_t offset = this->get_elem_offset(__ldg(this->indices + page_iter), head_idx,
+                                                  entry_idx, feat_idx);
+      DType* base = (use_remote_page(page_iter) && k_data_remote != nullptr) ? k_data_remote
+                                                                             : this->k_data;
+      return base + offset;
+    } else {
+      return this->k_data;
+    }
+  }
+
+  __device__ __forceinline__ DType* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
+                                                         uint32_t entry_idx, uint32_t feat_idx,
+                                                         IdType last_indptr) const {
+    if (page_iter < last_indptr) {
+      const size_t offset = this->get_elem_offset(__ldg(this->indices + page_iter), head_idx,
+                                                  entry_idx, feat_idx);
+      DType* base = (use_remote_page(page_iter) && v_data_remote != nullptr) ? v_data_remote
+                                                                             : this->v_data;
+      return base + offset;
+    } else {
+      return this->v_data;
+    }
+  }
+};
+
 /*!
  * \brief CUDA kernel to append new keys/values to the paged key-value cache in the decode phase
  * \tparam head_dim The dimension of each head

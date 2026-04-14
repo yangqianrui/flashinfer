@@ -59,4 +59,38 @@ struct Params {
   }
 };
 
+struct ParamsLocalRemote {
+  using DTypeQ = DTypeQ;
+  using DTypeKV = DTypeKV;
+  using DTypeO = DTypeO;
+  using IdType = IdType;
+
+  DTypeQ* q;
+  paged_kv_local_remote_t<DTypeKV, IdType> paged_kv;
+  DTypeO* o;
+  float* lse;
+
+  {{ additional_params_decl }}
+
+  uint32_t padded_batch_size;
+  uint32_t num_qo_heads;
+  IdType q_stride_n;
+  IdType q_stride_h;
+  int32_t window_left;
+  bool enable_pdl;
+
+  IdType* request_indices;
+  IdType* kv_tile_indices;
+  IdType* o_indptr;
+  IdType* kv_chunk_size_ptr;
+  bool* block_valid_mask;
+  bool partition_kv;
+
+  __host__ __device__ __forceinline__ int32_t get_qo_len(int32_t batch_idx) const { return 1; }
+
+  __host__ __device__ __forceinline__ int32_t get_kv_len(int32_t batch_idx) const {
+    return paged_kv.get_length(batch_idx);
+  }
+};
+
 {{ variant_decl }}
