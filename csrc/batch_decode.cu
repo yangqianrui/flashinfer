@@ -211,10 +211,12 @@ void BatchDecodeWithPagedKVCacheLocalRemoteRun(
     TensorView q, TensorView paged_k_cache_local, TensorView paged_v_cache_local,
     TensorView paged_k_cache_remote, TensorView paged_v_cache_remote, TensorView paged_kv_indptr,
     TensorView paged_kv_indices, TensorView paged_kv_last_page_len, TensorView paged_kv_page_device,
-    TensorView o, Optional<TensorView> maybe_lse, int64_t kv_layout_code, int64_t window_left,
-    bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+    TensorView paged_kv_indices_remote, TensorView o, Optional<TensorView> maybe_lse,
+    int64_t kv_layout_code, int64_t window_left, bool enable_pdl, bool fuse_writeback
+        ADDITIONAL_FUNC_PARAMS) {
   CHECK_INPUT_TYPE(paged_kv_indptr, dl_int32);
   CHECK_INPUT_TYPE(paged_kv_indices, dl_int32);
+  CHECK_INPUT_TYPE(paged_kv_indices_remote, dl_int32);
   CHECK_INPUT_TYPE(paged_kv_last_page_len, dl_int32);
   CHECK_INPUT_TYPE(paged_kv_page_device, dl_int32);
 
@@ -281,7 +283,9 @@ void BatchDecodeWithPagedKVCacheLocalRemoteRun(
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()),
-            static_cast<IdType*>(paged_kv_page_device.data_ptr()));
+            static_cast<IdType*>(paged_kv_page_device.data_ptr()),
+            static_cast<IdType*>(paged_kv_indices_remote.data_ptr()),
+            /*rope_pos_offset=*/nullptr, /*fuse_writeback=*/fuse_writeback);
 
         ParamsLocalRemote params;
         params.q = static_cast<DTypeQ*>(q.data_ptr());

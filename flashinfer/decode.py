@@ -239,6 +239,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
         paged_kv_page_device: torch.Tensor,
+        paged_kv_indices_remote: torch.Tensor,
         o: torch.Tensor,
         maybe_lse: Optional[torch.Tensor],
         kv_layout_code: int,
@@ -259,6 +260,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
             paged_kv_indices,
             paged_kv_last_page_len,
             paged_kv_page_device,
+            paged_kv_indices_remote,
             o,
             maybe_lse,
             kv_layout_code,
@@ -281,6 +283,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
         paged_kv_page_device: torch.Tensor,
+        paged_kv_indices_remote: torch.Tensor,
         o: torch.Tensor,
         maybe_lse: Optional[torch.Tensor],
         kv_layout_code: int,
@@ -390,6 +393,8 @@ def get_batch_decode_module(*args):
         mutates_args=(
             "float_workspace_buffer",
             "int_workspace_buffer",
+            # Fused writeback mirrors miss-page K/V from the remote pool
+            # into the local pool, so local k/v caches are mutated.
             "paged_k_cache_local",
             "paged_v_cache_local",
             "paged_k_cache_remote",
@@ -411,11 +416,13 @@ def get_batch_decode_module(*args):
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
         paged_kv_page_device: torch.Tensor,
+        paged_kv_indices_remote: torch.Tensor,
         o: torch.Tensor,
         maybe_lse: Optional[torch.Tensor],
         kv_layout_code: int,
         window_left: int,
         enable_pdl: bool,
+        fuse_writeback: bool,
         alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
@@ -435,11 +442,13 @@ def get_batch_decode_module(*args):
             paged_kv_indices,
             paged_kv_last_page_len,
             paged_kv_page_device,
+            paged_kv_indices_remote,
             o,
             maybe_lse,
             kv_layout_code,
             window_left,
             enable_pdl,
+            fuse_writeback,
             alibi_slopes,
             logits_soft_cap,
             sm_scale,
@@ -461,11 +470,13 @@ def get_batch_decode_module(*args):
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
         paged_kv_page_device: torch.Tensor,
+        paged_kv_indices_remote: torch.Tensor,
         o: torch.Tensor,
         maybe_lse: Optional[torch.Tensor],
         kv_layout_code: int,
         window_left: int,
         enable_pdl: bool,
+        fuse_writeback: bool,
         alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
@@ -1699,6 +1710,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_cache_remote: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         paged_kv_page_device: torch.Tensor,
         *args,
+        paged_kv_indices_remote: Optional[torch.Tensor] = None,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -1706,7 +1718,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        fuse_writeback: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """When ``fuse_writeback`` is True, every K/V vector the kernel
+        reads from the remote pool (``paged_kv_page_device[i] == 1``) is
+        mirrored back to the local pool at ``paged_kv_indices[i]`` during
+        the same kernel invocation. Lets the caller skip a separate
+        prefetch pass. No-op for hit entries.
+        """
         if self.use_tensor_cores or self._backend == "trtllm-gen":
             raise ValueError("run_local_remote is only implemented for CUDA-core batch decode.")
         if enable_pdl is None:
@@ -1718,15 +1737,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         k_cache_remote, v_cache_remote = _unpack_paged_kv_cache(
             paged_kv_cache_remote, self._kv_layout
         )
-        if k_cache_remote.shape != k_cache_local.shape:
+        # Local and remote pools are allowed to differ in the leading
+        # num_pages axis (compact local, full remote). All other dims must
+        # match so stride-based offset computation is shared.
+        if k_cache_remote.shape[1:] != k_cache_local.shape[1:]:
             raise ValueError(
-                f"k_cache_remote.shape {tuple(k_cache_remote.shape)} does not match "
-                f"k_cache_local.shape {tuple(k_cache_local.shape)}."
+                f"k_cache_remote.shape[1:] {tuple(k_cache_remote.shape[1:])} does not match "
+                f"k_cache_local.shape[1:] {tuple(k_cache_local.shape[1:])}."
             )
-        if v_cache_remote.shape != v_cache_local.shape:
+        if v_cache_remote.shape[1:] != v_cache_local.shape[1:]:
             raise ValueError(
-                f"v_cache_remote.shape {tuple(v_cache_remote.shape)} does not match "
-                f"v_cache_local.shape {tuple(v_cache_local.shape)}."
+                f"v_cache_remote.shape[1:] {tuple(v_cache_remote.shape[1:])} does not match "
+                f"v_cache_local.shape[1:] {tuple(v_cache_local.shape[1:])}."
             )
 
         _check_cached_qkv_data_type(
@@ -1754,6 +1776,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError(
                 "paged_kv_page_device must have at least as many entries as paged_kv_indices."
             )
+        if paged_kv_indices_remote is None:
+            # Legacy / mirror-layout path: both pools share the same logical
+            # index table. Safe only when local.shape == remote.shape.
+            paged_kv_indices_remote = self._paged_kv_indices_buf
+        else:
+            if paged_kv_indices_remote.dtype != torch.int32:
+                raise ValueError("paged_kv_indices_remote must be torch.int32.")
+            if paged_kv_indices_remote.device != q.device:
+                paged_kv_indices_remote = paged_kv_indices_remote.to(
+                    q.device, non_blocking=True
+                )
+            if paged_kv_indices_remote.numel() < self._paged_kv_indices_buf.numel():
+                raise ValueError(
+                    "paged_kv_indices_remote must have at least as many entries as paged_kv_indices."
+                )
 
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
@@ -1805,11 +1842,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
             paged_kv_page_device,
+            paged_kv_indices_remote,
             out,
             lse,
             TensorLayout[self._kv_layout].value,
             window_left,
             enable_pdl,
+            fuse_writeback,
         ]
 
         if self._jit_module is not None:

@@ -440,6 +440,14 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   DTypeKV** k_ptr_smem = reinterpret_cast<DTypeKV**>(kv_ptr_smem_storage);
   DTypeKV** v_ptr_smem =
       k_ptr_smem + tile_size_per_bdx * static_cast<uint32_t>(num_threads);
+  // Mirror-target pointers for fused writeback. When the page is a hit, or
+  // fuse_writeback is off, these are nullptr and the mirror-store loop skips
+  // this thread. Allocated unconditionally so launch-side smem accounting
+  // stays independent of the runtime `fuse_writeback` flag.
+  DTypeKV** k_mirror_ptr_smem =
+      v_ptr_smem + tile_size_per_bdx * static_cast<uint32_t>(num_threads);
+  DTypeKV** v_mirror_ptr_smem =
+      k_mirror_ptr_smem + tile_size_per_bdx * static_cast<uint32_t>(num_threads);
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                        sizeof(DTypeKV));
 
@@ -491,6 +499,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     if constexpr (use_local_remote_page_table) {
       k_ptr_smem[smem_idx] = paged_kv.protective_get_k_ptr(q, kv_head_idx, r, 0, last_indptr);
       v_ptr_smem[smem_idx] = paged_kv.protective_get_v_ptr(q, kv_head_idx, r, 0, last_indptr);
+      k_mirror_ptr_smem[smem_idx] = paged_kv.mirror_k_ptr(q, kv_head_idx, r, 0, last_indptr);
+      v_mirror_ptr_smem[smem_idx] = paged_kv.mirror_v_ptr(q, kv_head_idx, r, 0, last_indptr);
     } else {
       kv_offset_smem[smem_idx] =
           paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
@@ -501,6 +511,9 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   size_t kv_offset[tile_size_per_bdx];
   DTypeKV* k_ptr[tile_size_per_bdx];
   DTypeKV* v_ptr[tile_size_per_bdx];
+  // Mirror targets per tile slot; nullptr for hits or when fuse_writeback off.
+  DTypeKV* k_mirror_ptr[tile_size_per_bdx];
+  DTypeKV* v_mirror_ptr[tile_size_per_bdx];
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
 #pragma unroll
@@ -509,6 +522,10 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       if constexpr (use_local_remote_page_table) {
         k_ptr[j] = k_ptr_smem[smem_idx] + tx * vec_size;
         v_ptr[j] = v_ptr_smem[smem_idx] + tx * vec_size;
+        DTypeKV* km = k_mirror_ptr_smem[smem_idx];
+        DTypeKV* vm = v_mirror_ptr_smem[smem_idx];
+        k_mirror_ptr[j] = (km != nullptr) ? (km + tx * vec_size) : nullptr;
+        v_mirror_ptr[j] = (vm != nullptr) ? (vm + tx * vec_size) : nullptr;
       } else {
         kv_offset[j] = kv_offset_smem[smem_idx] + tx * vec_size;
       }
@@ -551,6 +568,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
         if constexpr (use_local_remote_page_table) {
           k_ptr_smem[smem_idx] = paged_kv.protective_get_k_ptr(q, kv_head_idx, r, 0, last_indptr);
           v_ptr_smem[smem_idx] = paged_kv.protective_get_v_ptr(q, kv_head_idx, r, 0, last_indptr);
+          k_mirror_ptr_smem[smem_idx] = paged_kv.mirror_k_ptr(q, kv_head_idx, r, 0, last_indptr);
+          v_mirror_ptr_smem[smem_idx] = paged_kv.mirror_v_ptr(q, kv_head_idx, r, 0, last_indptr);
         } else {
           kv_offset_smem[smem_idx] =
               paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
@@ -569,6 +588,32 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
         tz);
     block.sync();
 
+    // Fused writeback (K): mirror k_smem[stage_idx] back to the local
+    // HBM slot for miss pages (paged_kv.mirror_k_ptr != nullptr), so next
+    // step sees them as hits. No block.sync afterward — the shmem load
+    // completes thread-locally before the thread returns, and the global
+    // store is fire-and-forget (the kernel never reads back the mirror
+    // target). The next cp_async writes to k_smem[stage_idx] only after
+    // the thread has already consumed this stage's data, so no race.
+    if constexpr (use_local_remote_page_table) {
+      if (paged_kv.fuse_writeback) {
+#pragma unroll
+        for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+          const uint32_t ptr_smem_idx =
+              (((iter % bdx) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j;
+          DTypeKV* km = k_mirror_ptr_smem[ptr_smem_idx];
+          if (km != nullptr &&
+              ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size) {
+            vec_t<DTypeKV, vec_size> vv;
+            vv.load(k_smem +
+                    (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+                    tx * vec_size);
+            vv.store(km + tx * vec_size);
+          }
+        }
+      }
+    }
+
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       const uint32_t smem_idx =
@@ -576,6 +621,10 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       if constexpr (use_local_remote_page_table) {
         k_ptr[j] = k_ptr_smem[smem_idx] + tx * vec_size;
         v_ptr[j] = v_ptr_smem[smem_idx] + tx * vec_size;
+        DTypeKV* km = k_mirror_ptr_smem[smem_idx];
+        DTypeKV* vm = v_mirror_ptr_smem[smem_idx];
+        k_mirror_ptr[j] = (km != nullptr) ? (km + tx * vec_size) : nullptr;
+        v_mirror_ptr[j] = (vm != nullptr) ? (vm + tx * vec_size) : nullptr;
       } else {
         kv_offset[j] = kv_offset_smem[smem_idx] + tx * vec_size;
       }
@@ -599,6 +648,27 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
     block.sync();
 
+    // Fused writeback (V): same thread-local pattern as the K mirror
+    // above, no block.sync needed.
+    if constexpr (use_local_remote_page_table) {
+      if (paged_kv.fuse_writeback) {
+#pragma unroll
+        for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+          const uint32_t ptr_smem_idx =
+              (((iter % bdx) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j;
+          DTypeKV* vm = v_mirror_ptr_smem[ptr_smem_idx];
+          if (vm != nullptr &&
+              ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size) {
+            vec_t<DTypeKV, vec_size> vv;
+            vv.load(v_smem +
+                    (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+                    tx * vec_size);
+            vv.store(vm + tx * vec_size);
+          }
+        }
+      }
+    }
+
     // load v tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -613,6 +683,19 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   }
   cp_async::wait_group<0>();
   block.sync();
+
+  // Fused writeback: make sure every mirror `st.global` issued above has
+  // become visible before the kernel exits. Without this fence those
+  // stores can still be in-flight when the kernel returns, and the next
+  // op on the same stream (e.g. o_proj) gets its HBM reads serialized
+  // behind the pending writes — empirically this causes 2-3x run-to-run
+  // latency variance depending on scheduling state. One fence at kernel
+  // tail is cheap (< 1% of kernel time) and makes timing deterministic.
+  if constexpr (use_local_remote_page_table) {
+    if (paged_kv.fuse_writeback) {
+      __threadfence();
+    }
+  }
 
   // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md, tx, ty,
@@ -797,9 +880,13 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
+      // Pointer smem now holds 4 parallel arrays (k_ptr, v_ptr,
+      // k_mirror_ptr, v_mirror_ptr) to support fused writeback. The
+      // mirror_ptr arrays stay allocated even when fuse_writeback is off —
+      // runtime cost is a handful of KB of smem, simpler launch.
       const uint32_t smem_size =
           2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-          std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
+          std::max(4 * tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
                    2 * bdy * bdz * sizeof(float));
       auto kernel =
           BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
@@ -883,9 +970,10 @@ cudaError_t BatchDecodeWithPagedKVCacheLocalRemoteDispatched(
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
+      // 4 parallel pointer arrays: k_ptr + v_ptr + k_mirror_ptr + v_mirror_ptr.
       const uint32_t smem_size =
           2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-          std::max(2 * tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
+          std::max(4 * tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
                    2 * bdy * bdz * sizeof(float));
       auto kernel = BatchDecodeWithPagedKVCacheLocalRemoteKernel<
           POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx, vec_size, bdx, bdy, bdz,

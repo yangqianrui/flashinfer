@@ -41,8 +41,9 @@ void BatchDecodeWithPagedKVCacheLocalRemoteRun(
     TensorView q, TensorView paged_k_cache_local, TensorView paged_v_cache_local,
     TensorView paged_k_cache_remote, TensorView paged_v_cache_remote, TensorView paged_kv_indptr,
     TensorView paged_kv_indices, TensorView paged_kv_last_page_len, TensorView paged_kv_page_device,
-    TensorView o, Optional<TensorView> maybe_lse, int64_t kv_layout_code, int64_t window_left,
-    bool enable_pdl ADDITIONAL_FUNC_PARAMS);
+    TensorView paged_kv_indices_remote, TensorView o, Optional<TensorView> maybe_lse,
+    int64_t kv_layout_code, int64_t window_left, bool enable_pdl, bool fuse_writeback
+        ADDITIONAL_FUNC_PARAMS);
 
 // Batched decode with paged KV-Cache plan
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchDecodeWithPagedKVCachePlan);
