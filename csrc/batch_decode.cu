@@ -285,7 +285,7 @@ void BatchDecodeWithPagedKVCacheLocalRemoteRun(
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()),
             static_cast<IdType*>(paged_kv_page_device.data_ptr()),
             static_cast<IdType*>(paged_kv_indices_remote.data_ptr()),
-            /*rope_pos_offset=*/nullptr, /*fuse_writeback=*/fuse_writeback);
+            fuse_writeback);
 
         ParamsLocalRemote params;
         params.q = static_cast<DTypeQ*>(q.data_ptr());

@@ -1709,8 +1709,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_cache_local: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         paged_kv_cache_remote: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         paged_kv_page_device: torch.Tensor,
+        paged_kv_indices_remote: torch.Tensor,
         *args,
-        paged_kv_indices_remote: Optional[torch.Tensor] = None,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -1720,11 +1720,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         fuse_writeback: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """When ``fuse_writeback`` is True, every K/V vector the kernel
-        reads from the remote pool (``paged_kv_page_device[i] == 1``) is
-        mirrored back to the local pool at ``paged_kv_indices[i]`` during
-        the same kernel invocation. Lets the caller skip a separate
-        prefetch pass. No-op for hit entries.
+        """Sparse attention with a compact local pool and a full remote pool.
+
+        ``paged_kv_indices`` (installed by ``plan``) indexes the local pool;
+        ``paged_kv_indices_remote`` indexes the remote pool; ``page_device``
+        picks the pool per entry (0=local, 1=remote). When
+        ``fuse_writeback=True``, every miss-page K/V the kernel reads is
+        mirrored back to ``paged_kv_indices[i]`` on the local pool in the
+        same kernel pass — no separate prefetch needed.
         """
         if self.use_tensor_cores or self._backend == "trtllm-gen":
             raise ValueError("run_local_remote is only implemented for CUDA-core batch decode.")
@@ -1737,9 +1740,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         k_cache_remote, v_cache_remote = _unpack_paged_kv_cache(
             paged_kv_cache_remote, self._kv_layout
         )
-        # Local and remote pools are allowed to differ in the leading
-        # num_pages axis (compact local, full remote). All other dims must
-        # match so stride-based offset computation is shared.
+        # Pools may differ on the leading num_pages axis (compact local,
+        # full remote); every other dim must match so stride-based offsets
+        # work for both.
         if k_cache_remote.shape[1:] != k_cache_local.shape[1:]:
             raise ValueError(
                 f"k_cache_remote.shape[1:] {tuple(k_cache_remote.shape[1:])} does not match "
@@ -1750,18 +1753,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 f"v_cache_remote.shape[1:] {tuple(v_cache_remote.shape[1:])} does not match "
                 f"v_cache_local.shape[1:] {tuple(v_cache_local.shape[1:])}."
             )
-
+        if v_cache_remote.dtype != v_cache_local.dtype:
+            raise ValueError(
+                f"v_cache_remote.dtype {v_cache_remote.dtype} does not match "
+                f"v_cache_local.dtype {v_cache_local.dtype}."
+            )
         _check_cached_qkv_data_type(
             q, k_cache_local, self._cached_q_data_type, self._cached_kv_data_type
         )
         _check_cached_qkv_data_type(
             q, k_cache_remote, self._cached_q_data_type, self._cached_kv_data_type
         )
-        if v_cache_remote.dtype != v_cache_local.dtype:
-            raise ValueError(
-                f"v_cache_remote.dtype {v_cache_remote.dtype} does not match "
-                f"v_cache_local.dtype {v_cache_local.dtype}."
-            )
 
         actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
         if q.size(0) != actual_batch_size:
@@ -1770,27 +1772,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         if paged_kv_page_device.dtype != torch.int32:
             raise ValueError("paged_kv_page_device must be torch.int32.")
+        if paged_kv_indices_remote.dtype != torch.int32:
+            raise ValueError("paged_kv_indices_remote must be torch.int32.")
         if paged_kv_page_device.device != q.device:
             paged_kv_page_device = paged_kv_page_device.to(q.device, non_blocking=True)
-        if paged_kv_page_device.numel() < self._paged_kv_indices_buf.numel():
+        if paged_kv_indices_remote.device != q.device:
+            paged_kv_indices_remote = paged_kv_indices_remote.to(q.device, non_blocking=True)
+        n_entries = self._paged_kv_indices_buf.numel()
+        if paged_kv_page_device.numel() < n_entries:
             raise ValueError(
                 "paged_kv_page_device must have at least as many entries as paged_kv_indices."
             )
-        if paged_kv_indices_remote is None:
-            # Legacy / mirror-layout path: both pools share the same logical
-            # index table. Safe only when local.shape == remote.shape.
-            paged_kv_indices_remote = self._paged_kv_indices_buf
-        else:
-            if paged_kv_indices_remote.dtype != torch.int32:
-                raise ValueError("paged_kv_indices_remote must be torch.int32.")
-            if paged_kv_indices_remote.device != q.device:
-                paged_kv_indices_remote = paged_kv_indices_remote.to(
-                    q.device, non_blocking=True
-                )
-            if paged_kv_indices_remote.numel() < self._paged_kv_indices_buf.numel():
-                raise ValueError(
-                    "paged_kv_indices_remote must have at least as many entries as paged_kv_indices."
-                )
+        if paged_kv_indices_remote.numel() < n_entries:
+            raise ValueError(
+                "paged_kv_indices_remote must have at least as many entries as paged_kv_indices."
+            )
 
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap

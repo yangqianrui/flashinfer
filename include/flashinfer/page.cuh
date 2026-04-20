@@ -209,21 +209,22 @@ struct paged_kv_t {
   }
 };
 
+// Paged KV cache split across two pools: a compact local pool (HBM) and a
+// full-size remote pool (typically another GPU reached over NVLink). Per
+// selected page `i`, `page_device[i]` picks the pool, `indices[i]` indexes
+// the local pool (= slot id in a compact pool), `indices_remote[i]` indexes
+// the remote pool (= logical page id in a full pool). When
+// `fuse_writeback == true` the attention kernel mirrors every K/V it reads
+// from the remote pool back into `indices[i]` on the local pool in the
+// same pass, eliminating a separate prefetch over NVLink.
+//
+// All pointer fields must be non-null — no fallback paths.
 template <typename DType, typename IdType>
 struct paged_kv_local_remote_t : public paged_kv_t<DType, IdType> {
   DType* k_data_remote;
   DType* v_data_remote;
-  // Per-selected-page logical id for the remote pool. Allows `k_data_remote` /
-  // `v_data_remote` to have a different shape (typically larger, full-capacity)
-  // than the local pool `k_data` / `v_data`. The inherited `indices` points
-  // into the local pool. When `indices_remote == nullptr` the struct falls
-  // back to using `indices` for both pools (legacy behaviour).
   IdType* indices_remote;
   IdType* page_device;
-  // When true, the attention kernel mirrors every K/V vector it reads from
-  // the remote pool back into the local pool at `indices[page_iter]`. Saves
-  // the separate prefetch pass that would otherwise re-read the same pages
-  // over NVLink — net NVLink traffic drops from 2× per miss page to 1×.
   bool fuse_writeback;
 
   __host__ __device__ __forceinline__ paged_kv_local_remote_t()
@@ -237,24 +238,9 @@ struct paged_kv_local_remote_t : public paged_kv_t<DType, IdType> {
   __host__ __forceinline__ paged_kv_local_remote_t(
       uint32_t num_heads, uint32_t page_size, uint32_t head_dim, uint32_t batch_size,
       QKVLayout layout, DType* k_data_local, DType* v_data_local, DType* k_data_remote,
-      DType* v_data_remote, IdType* indices, IdType* indptr, IdType* last_page_len,
-      IdType* page_device, IdType* indices_remote = nullptr,
-      IdType* rope_pos_offset = nullptr, bool fuse_writeback = false)
-      : paged_kv_t<DType, IdType>(num_heads, page_size, head_dim, batch_size, layout,
-                                  k_data_local, v_data_local, indices, indptr, last_page_len,
-                                  rope_pos_offset),
-        k_data_remote(k_data_remote),
-        v_data_remote(v_data_remote),
-        indices_remote(indices_remote),
-        page_device(page_device),
-        fuse_writeback(fuse_writeback) {}
-
-  __host__ __forceinline__ paged_kv_local_remote_t(
-      uint32_t num_heads, uint32_t page_size, uint32_t head_dim, uint32_t batch_size,
-      QKVLayout layout, DType* k_data_local, DType* v_data_local, DType* k_data_remote,
       DType* v_data_remote, const int64_t* kv_strides, IdType* indices, IdType* indptr,
-      IdType* last_page_len, IdType* page_device, IdType* indices_remote = nullptr,
-      IdType* rope_pos_offset = nullptr, bool fuse_writeback = false)
+      IdType* last_page_len, IdType* page_device, IdType* indices_remote,
+      bool fuse_writeback, IdType* rope_pos_offset = nullptr)
       : paged_kv_t<DType, IdType>(num_heads, page_size, head_dim, batch_size, layout,
                                   k_data_local, v_data_local, kv_strides, indices, indptr,
                                   last_page_len, rope_pos_offset),
@@ -265,59 +251,40 @@ struct paged_kv_local_remote_t : public paged_kv_t<DType, IdType> {
         fuse_writeback(fuse_writeback) {}
 
   __device__ __forceinline__ bool use_remote_page(IdType page_iter) const {
-    return page_device != nullptr && __ldg(page_device + page_iter) != 0;
-  }
-
-  // Pick the index to resolve for this page slot based on which pool we will
-  // read. When `indices_remote == nullptr` both pools share `indices` (mirror
-  // layout).
-  __device__ __forceinline__ IdType get_routed_index(IdType page_iter, bool is_remote) const {
-    if (is_remote && indices_remote != nullptr) {
-      return __ldg(indices_remote + page_iter);
-    }
-    return __ldg(this->indices + page_iter);
+    return __ldg(page_device + page_iter) != 0;
   }
 
   __device__ __forceinline__ DType* protective_get_k_ptr(IdType page_iter, uint32_t head_idx,
                                                          uint32_t entry_idx, uint32_t feat_idx,
                                                          IdType last_indptr) const {
-    if (page_iter < last_indptr) {
-      const bool is_remote = use_remote_page(page_iter) && k_data_remote != nullptr;
-      const IdType idx = get_routed_index(page_iter, is_remote);
-      const size_t offset = this->get_elem_offset(idx, head_idx, entry_idx, feat_idx);
-      DType* base = is_remote ? k_data_remote : this->k_data;
-      return base + offset;
-    } else {
-      return this->k_data;
-    }
+    if (page_iter >= last_indptr) return this->k_data;
+    const bool is_remote = use_remote_page(page_iter);
+    const IdType idx = is_remote ? __ldg(indices_remote + page_iter)
+                                 : __ldg(this->indices + page_iter);
+    const size_t offset = this->get_elem_offset(idx, head_idx, entry_idx, feat_idx);
+    return (is_remote ? k_data_remote : this->k_data) + offset;
   }
 
   __device__ __forceinline__ DType* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
                                                          uint32_t entry_idx, uint32_t feat_idx,
                                                          IdType last_indptr) const {
-    if (page_iter < last_indptr) {
-      const bool is_remote = use_remote_page(page_iter) && v_data_remote != nullptr;
-      const IdType idx = get_routed_index(page_iter, is_remote);
-      const size_t offset = this->get_elem_offset(idx, head_idx, entry_idx, feat_idx);
-      DType* base = is_remote ? v_data_remote : this->v_data;
-      return base + offset;
-    } else {
-      return this->v_data;
-    }
+    if (page_iter >= last_indptr) return this->v_data;
+    const bool is_remote = use_remote_page(page_iter);
+    const IdType idx = is_remote ? __ldg(indices_remote + page_iter)
+                                 : __ldg(this->indices + page_iter);
+    const size_t offset = this->get_elem_offset(idx, head_idx, entry_idx, feat_idx);
+    return (is_remote ? v_data_remote : this->v_data) + offset;
   }
 
-  // When this page slot is a miss being served from the remote pool and
-  // `fuse_writeback` is on, return the local HBM address where the attention
-  // kernel should mirror the loaded K back to. Returns nullptr if the slot is
-  // a hit (no work needed), past the end (padding), or fuse_writeback is off.
-  // The mirror target is `indices[page_iter]` on the *local* pool — engine
-  // alloc_and_route already chose this slot as the miss's destination.
+  // Fused-writeback mirror target. For a miss page, returns the local HBM
+  // slot address the kernel should store the K/V back into. Returns nullptr
+  // for hits, padding, or when fuse_writeback is off.
   __device__ __forceinline__ DType* mirror_k_ptr(IdType page_iter, uint32_t head_idx,
                                                   uint32_t entry_idx, uint32_t feat_idx,
                                                   IdType last_indptr) const {
     if (!fuse_writeback) return nullptr;
     if (page_iter >= last_indptr) return nullptr;
-    if (!(use_remote_page(page_iter) && k_data_remote != nullptr)) return nullptr;
+    if (!use_remote_page(page_iter)) return nullptr;
     const IdType local_slot = __ldg(this->indices + page_iter);
     return this->k_data + this->get_elem_offset(local_slot, head_idx, entry_idx, feat_idx);
   }
@@ -327,7 +294,7 @@ struct paged_kv_local_remote_t : public paged_kv_t<DType, IdType> {
                                                   IdType last_indptr) const {
     if (!fuse_writeback) return nullptr;
     if (page_iter >= last_indptr) return nullptr;
-    if (!(use_remote_page(page_iter) && v_data_remote != nullptr)) return nullptr;
+    if (!use_remote_page(page_iter)) return nullptr;
     const IdType local_slot = __ldg(this->indices + page_iter);
     return this->v_data + this->get_elem_offset(local_slot, head_idx, entry_idx, feat_idx);
   }
